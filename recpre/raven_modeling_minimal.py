@@ -107,6 +107,9 @@ class RavenPreTrainedModel(PreTrainedModel):
                 self._normal_(module.weight, std=float(_init_values["out_proj"]))
             elif "adapter" in name or "lm_head" in name:
                 self._normal_(module.weight, std=float(_init_values["std"]))
+            elif "iter_proj" in name or "ccot_proj" in name:
+                # Zero init so both injection modes start as no-ops.
+                torch.nn.init.zeros_(module.weight)
         elif isinstance(module, torch.nn.Embedding):
             self._normal_(module.weight, std=float(_init_values["embedding"]))
 
@@ -559,6 +562,15 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         o = config.n_layers_in_prelude + config.n_layers_in_recurrent_block * config.mean_recurrence
         coda = torch.nn.ModuleList(SandwichBlock(config, layer_id=i + o) for i in range(config.n_layers_in_coda))
 
+        # iter_proj: projects the previous *iteration's* loop output before injecting
+        # it into the current iteration (within-query, iteration-to-iteration).
+        # ccot_proj: projects the previous *query's* final loop state before injecting
+        # it into the current query (cross-query episodic memory).
+        # Both are zero-initialized so the respective modes start as no-ops and
+        # finetuning begins from the original model's behavior.
+        iter_proj = torch.nn.Linear(config.n_embd, config.n_embd, bias=False)
+        ccot_proj = torch.nn.Linear(config.n_embd, config.n_embd, bias=False)
+
         self.transformer = torch.nn.ModuleDict(
             dict(
                 wte=torch.nn.Embedding(config.padded_vocab_size, config.n_embd),
@@ -567,6 +579,8 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
                 core_block=core_block,
                 coda=coda,
                 ln_f=RMSNorm(config.n_embd, eps=config.norm_eps),  # used twice :>
+                iter_proj=iter_proj,
+                ccot_proj=ccot_proj,
             )
         )
         # Head
@@ -654,6 +668,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         use_cache: bool = False,
         cache_position: Optional[torch.Tensor] = None,
         init_scale: float = 1.0,
+        ccot_memory: Optional[torch.Tensor] = None,  # final loop state from the previous query [B, S_prev, E]
         **kwargs,
     ) -> CausalLMOutputRecurrentLatents:
         # Support multiple position formats:
@@ -690,6 +705,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             past_key_values,
             num_steps,
             init_scale,
+            ccot_memory,
         )
         latent_states = x.clone().detach()
 
@@ -734,6 +750,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         past_key_values: Optional[ValidCache] = None,
         num_steps: Optional[torch.Tensor] = None,
         init_scale: float = 1.0,
+        ccot_memory: Optional[torch.Tensor] = None,
     ):
         x = xk = self.initialize_state(input_embeds, scale=init_scale) if input_states is None else input_states.clone()
         if num_steps is None:
@@ -751,13 +768,15 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             for no_grad_step in range(num_steps_no_grad):
                 xk = x
                 x, block_idx = self.core_block_forward(
-                    xk, input_embeds, freqs_cis, mask, past_key_values, block_idx, no_grad_step
+                    xk, input_embeds, freqs_cis, mask, past_key_values, block_idx, no_grad_step,
+                    ccot_memory=ccot_memory,
                 )
 
         for grad_step in range(num_steps_with_grad):
             xk = x
             x, block_idx = self._maybe_checkpoint_core_block(
-                xk, input_embeds, freqs_cis, mask, past_key_values, block_idx, num_steps_no_grad + grad_step
+                xk, input_embeds, freqs_cis, mask, past_key_values, block_idx, num_steps_no_grad + grad_step,
+                ccot_memory=ccot_memory,
             )
         return self.transformer.ln_f(x), num_steps_no_grad, num_steps_with_grad, xk.detach(), block_idx  # type: ignore # types broken in 2.6+
 
@@ -770,13 +789,60 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         past_key_values,
         block_idx: torch.Tensor,
         current_step: int | Tensor,
+        ccot_memory: Optional[torch.Tensor] = None,
     ):
         block_idx = block_idx.detach().clone()  # line only included to convince torch.checkpointing
+
+        # ── iter_injection (within-query, iteration-to-iteration) ────────────────
+        # x_prev is the previous loop iteration's output for this query.
+        x_prev = x
+
         x = self._maybe_inject_noise(x, current_step)
-        x = self.transformer.adapter(torch.cat([x, input_embeds.to(x.device)], dim=-1))  # type: ignore # types broken in 2.6+
-        for block in self.transformer.core_block:  # type: ignore # types broken in 2.6+
+        x = self.transformer.adapter(torch.cat([x, input_embeds.to(x.device)], dim=-1))  # type: ignore
+
+        if self.config.iter_injection == "add":
+            # Residual add of projected previous-iteration output. Zero-init means
+            # this is a strict no-op at the start of training.
+            x = x + self.transformer.iter_proj(x_prev)  # type: ignore
+
+        elif self.config.iter_injection == "prepend":
+            # Prepend x_prev as S extra "thought tokens". KV caching unsupported.
+            if past_key_values is not None:
+                raise ValueError("iter_injection='prepend' does not support KV caching.")
+            x_mem = self.transformer.iter_proj(x_prev)  # type: ignore  [B, S, E]
+            x = torch.cat([x_mem, x], dim=1)             # [B, 2*S, E]
+            # Tile freqs_cis so x_current retains its original RoPE positions.
+            freqs_cis = torch.cat([freqs_cis, freqs_cis], dim=1)
+
+        # ── ccot_injection (cross-query episodic memory) ─────────────────────────
+        # ccot_memory is the final loop state from the *previous query*, passed in
+        # by the caller. It may have a different sequence length, so we mean-pool it
+        # to a single [B, 1, E] summary vector before injecting.
+        if ccot_memory is not None and self.config.ccot_injection != "none":
+            ccot_summary = self.transformer.ccot_proj(  # type: ignore
+                ccot_memory.mean(dim=1, keepdim=True)   # [B, 1, E]
+            )
+            if self.config.ccot_injection == "add":
+                # Broadcast-add across all sequence positions.
+                x = x + ccot_summary
+            elif self.config.ccot_injection == "prepend":
+                # Prepend as a single "memory token". KV caching unsupported.
+                if past_key_values is not None:
+                    raise ValueError("ccot_injection='prepend' does not support KV caching.")
+                x = torch.cat([ccot_summary, x], dim=1)           # [B, S+1, E]
+                # Give the memory token RoPE position 0 (same as the first real token).
+                freqs_cis = torch.cat([freqs_cis[:, :1], freqs_cis], dim=1)
+
+        # ── core block layers ─────────────────────────────────────────────────────
+        for block in self.transformer.core_block:  # type: ignore
             block_idx += 1
             x = block(x, freqs_cis, block_idx, mask, past_key_values)
+
+        # ── slice off any prepended tokens ────────────────────────────────────────
+        if self.config.iter_injection == "prepend":
+            x = x[:, x_prev.shape[1]:, :]          # drop iter memory half
+        if ccot_memory is not None and self.config.ccot_injection == "prepend":
+            x = x[:, 1:, :]                         # drop the single ccot token
 
         return x, block_idx
 
@@ -849,6 +915,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         attention_mask: Optional[BlockMask] = None,
         past_key_values: Optional[ValidCache] = None,
         current_step: int = 0,
+        ccot_memory: Optional[torch.Tensor] = None,
     ):
         if position_ids is None and cache_position is None:
             freqs_cis = self.freqs_cis[:, : input_embeds.shape[1]]
@@ -864,6 +931,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             past_key_values,
             block_idx,
             current_step=current_step,
+            ccot_memory=ccot_memory,
         )
         return x, block_idx, current_step + 1
 

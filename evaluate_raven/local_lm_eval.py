@@ -25,19 +25,27 @@ from lm_eval.utils import (
 )
 
 
-####### Only difference:
-####### oh I really stopped caring about python in this part
-try:
-    import recpre  # noqa: F401
-except ModuleNotFoundError:
-    try:
-        wd = Path.cwd()
-        sys.path.append(str(wd))
-        import recpre  # noqa: F401
-    except ModuleNotFoundError:
-        wd = Path.cwd().parent
-        sys.path.append(str(wd))
-        import recpre  # noqa: F401
+####### Only difference: load the two minimal modeling files directly via
+####### importlib to bypass recpre/__init__.py, which imports recpre.utils,
+####### which references a torch internal symbol removed in torch >= 2.11.
+import importlib.util as _ilu
+
+def _load_recpre_minimal(root: Path) -> bool:
+    for _name, _rel in [
+        ("recpre.raven_config_minimal",   "recpre/raven_config_minimal.py"),
+        ("recpre.raven_modeling_minimal", "recpre/raven_modeling_minimal.py"),
+    ]:
+        _path = root / _rel
+        if not _path.exists():
+            return False
+        _spec = _ilu.spec_from_file_location(_name, str(_path))
+        _mod  = _ilu.module_from_spec(_spec)
+        sys.modules[_name] = _mod
+        _spec.loader.exec_module(_mod)
+    return True
+
+if not _load_recpre_minimal(Path.cwd()):
+    _load_recpre_minimal(Path.cwd().parent)
 print("""
 Use this only if you made changes to litgpt/raven_modeling.py and want to test those changes with lm-eval
 If you just want to evaluate the model, do not use this script, use lm-eval directly!
