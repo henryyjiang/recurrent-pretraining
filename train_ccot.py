@@ -246,20 +246,48 @@ def load_model(iter_injection="none", ccot_injection="none", train_loop=True):
 
 
 def save_checkpoint(model, name: str):
+    """Save only the trainable weights + config. Much smaller than a full checkpoint.
+    Base model weights are loaded fresh from HF cache at eval time."""
     path = OUTPUT_DIR / name
     path.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(str(path))
-    log(f"  Saved → {path}")
+
+    # Trainable weights only
+    trainable_state = {k: v for k, v in model.state_dict().items()
+                       if any(p.requires_grad for n, p in model.named_parameters() if n == k)}
+    torch.save(trainable_state, path / "trainable_weights.pt")
+
+    # Config so we know which injections were active
+    model.config.save_pretrained(str(path))
+
+    n_params = sum(t.numel() for t in trainable_state.values())
+    size_mb  = sum(t.numel() * t.element_size() for t in trainable_state.values()) / 1e6
+    log(f"  Saved → {path}  ({n_params:,} params, {size_mb:.0f} MB)")
 
 
 def load_checkpoint(name: str, iter_injection="none", ccot_injection="none"):
+    """Load base model from HF cache, then overlay the saved trainable weights."""
     path = OUTPUT_DIR / name
     cfg  = RavenConfig.from_pretrained(str(path))
     cfg.iter_injection = iter_injection
     cfg.ccot_injection = ccot_injection
+
+    # Load fresh base model (hits HF cache — no re-download)
     model = AutoModelForCausalLM.from_pretrained(
-        str(path), config=cfg, torch_dtype=DTYPE, device_map=DEVICE
+        ARGS.model_name, config=cfg, torch_dtype=DTYPE,
+        device_map=DEVICE, ignore_mismatched_sizes=True,
     )
+
+    # Overlay finetuned weights
+    weights_path = path / "trainable_weights.pt"
+    if weights_path.exists():
+        delta = torch.load(str(weights_path), map_location=DEVICE)
+        missing, unexpected = model.load_state_dict(delta, strict=False)
+        if unexpected:
+            log(f"  WARNING: unexpected keys in checkpoint: {unexpected}")
+        log(f"  Loaded {len(delta)} weight tensors from {weights_path}")
+    else:
+        log(f"  WARNING: no trainable_weights.pt found at {path}, using base model")
+
     model.eval()
     return model
 

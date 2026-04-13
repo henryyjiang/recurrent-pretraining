@@ -1,26 +1,26 @@
 #!/bin/bash
-#SBATCH --job-name=huginn_ccot
-#SBATCH --output=logs/%x_%j.out
-#SBATCH --error=logs/%x_%j.err
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --gres=gpu:a100:1          # adjust to your cluster's GPU name
+#SBATCH -J huginn_ccot
+#SBATCH -A gts-vfung3
+#SBATCH -o logs/huginn_ccot_%j.out
+#SBATCH -qinferno
+#SBATCH -N1 --gres=gpu:A100:1
 #SBATCH --mem=80G
-#SBATCH --time=24:00:00
-#SBATCH --partition=gpu            # adjust to your cluster's partition name
+#SBATCH -t24:00:00
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --mail-user=hjiang378@gatech.edu
 
 # ── Create log dir if it doesn't exist ────────────────────────────────────
 mkdir -p logs
 
 # ── Activate conda env ────────────────────────────────────────────────────
 source ~/.bashrc
-conda activate huginn            # or: module load anaconda; conda activate huginn
+conda activate huginn
 
 # ── Point HuggingFace cache to scratch (avoids filling home quota) ────────
-export HF_HOME=/scratch/$USER/hf_cache
+export HF_HOME=$HOME/scratch/hf_cache
 export TRANSFORMERS_CACHE=$HF_HOME
 export HF_DATASETS_CACHE=$HF_HOME
+mkdir -p $HF_HOME
 
 # ── Move to repo root ─────────────────────────────────────────────────────
 cd $SLURM_SUBMIT_DIR
@@ -32,13 +32,14 @@ python train_ccot.py \
     --experiments iter_only ccot_only both \
     --output_dir  ./runs/ccot_${RUN_ID} \
     --model_name  tomg-group-umd/huginn-0125 \
-    --hf_cache    /scratch/$USER/hf_cache \
+    --hf_cache    $HOME/scratch/hf_cache \
     --epochs      5 \
-    --lr          3e-4 \
-    --batch_size  2 \
-    --grad_accum  16 \
+    --lr          1e-4 \
+    --batch_size  1 \
+    --grad_accum  32 \
     --num_steps   32 \
-    --backprop_depth 8 \
+    --backprop_depth 4 \
+    --grad_checkpoint \
     --n_eval      200
 
 echo "Job finished: $RUN_ID"
