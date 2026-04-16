@@ -44,6 +44,8 @@ for _name, _rel in [
     _spec.loader.exec_module(_mod)
 
 import os
+from typing import Optional
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from recpre.raven_config_minimal import RavenConfig
@@ -57,6 +59,74 @@ DTYPE  = torch.bfloat16
 DEVICE = "cuda"
 
 
+# ---------------------------------------------------------------------------
+# Multi-pass wrapper
+# ---------------------------------------------------------------------------
+class MultiPassWrapper(torch.nn.Module):
+    """Wraps RavenForCausalLM to perform N-1 no-grad warmup passes before any
+    scored forward or generate call.
+
+    Each warmup pass re-reads the same input tokens and chains the final loop
+    latent state (ccot_memory) into the next pass via ccot_proj.  This mirrors
+    the latent-CoT training procedure in train_ccot.py: the model refines an
+    internal "scratchpad" state over multiple passes before committing to a
+    prediction, analogous to chain-of-thought token generation but without
+    materialising intermediate tokens.
+
+    ccot_memory resets to None for every new batch — there is no cross-example
+    chaining during evaluation.
+    """
+
+    def __init__(self, base_model: torch.nn.Module,
+                 num_passes: int, steps_per_pass: int):
+        super().__init__()
+        self.base_model    = base_model
+        self.num_passes    = num_passes
+        self.steps_per_pass = steps_per_pass
+        # Proxy config so HFLM can introspect model_type, vocab_size, etc.
+        self.config = base_model.config
+
+    # ── Attribute proxy (forwards unknown attrs to base_model) ───────────
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.base_model, name)
+
+    # ── Warmup ───────────────────────────────────────────────────────────
+    @torch.no_grad()
+    def _warmup(self, input_ids: torch.Tensor) -> Optional[torch.Tensor]:
+        """Run num_passes-1 warmup passes; return the final ccot_memory."""
+        if self.num_passes <= 1:
+            return None
+        od = {"return_logits": False, "return_latents": True,
+              "return_head":   False, "return_stats":   False}
+        ccot_memory = None
+        for _ in range(self.num_passes - 1):
+            out = self.base_model(
+                input_ids=input_ids,
+                num_steps=self.steps_per_pass,
+                ccot_memory=ccot_memory,
+                output_details=od,
+            )
+            ccot_memory = out.latent_states.detach()
+        return ccot_memory
+
+    # ── Scored forward (loglikelihood tasks) ─────────────────────────────
+    def forward(self, input_ids: torch.Tensor, **kwargs):
+        ccot_memory = self._warmup(input_ids)
+        kwargs["num_steps"] = self.steps_per_pass
+        return self.base_model(input_ids=input_ids,
+                               ccot_memory=ccot_memory, **kwargs)
+
+    # ── Generation tasks ─────────────────────────────────────────────────
+    def generate(self, input_ids: torch.Tensor, **kwargs):
+        ccot_memory = self._warmup(input_ids)
+        kwargs["num_steps"] = self.steps_per_pass
+        return self.base_model.generate(input_ids=input_ids,
+                                        ccot_memory=ccot_memory, **kwargs)
+
+
 # ── Checkpoint definitions ─────────────────────────────────────────────────
 # Each entry: (label, iter_injection, ccot_injection, subdir_or_None)
 # subdir_or_None=None means the frozen base model (no delta loaded).
@@ -68,7 +138,8 @@ EXPERIMENTS = [
 ]
 
 
-def load_model(model_name, run_dir, subdir, iter_injection, ccot_injection):
+def load_model(model_name, run_dir, subdir, iter_injection, ccot_injection,
+               num_passes: int = 1, steps_per_pass: Optional[int] = None):
     cfg = RavenConfig.from_pretrained(model_name)
     cfg.iter_injection = iter_injection
     cfg.ccot_injection = ccot_injection
@@ -93,6 +164,15 @@ def load_model(model_name, run_dir, subdir, iter_injection, ccot_injection):
         log(f"  Overlaid {len(delta)} tensors from {weights_path}")
 
     model.eval()
+
+    # Wrap with MultiPassWrapper for CCoT experiments so that lm-eval sees a
+    # standard model interface while the warmup passes are handled transparently.
+    if ccot_injection != "none" and num_passes > 1 and steps_per_pass is not None:
+        log(f"  Wrapping with MultiPassWrapper "
+            f"(num_passes={num_passes}, steps_per_pass={steps_per_pass})")
+        model = MultiPassWrapper(model, num_passes=num_passes,
+                                 steps_per_pass=steps_per_pass)
+
     return model
 
 
@@ -144,6 +224,10 @@ def main():
     parser.add_argument("--experiments", nargs="+",
                         default=["Baseline", "iter_only", "ccot_only", "both"],
                         help="Which experiments to evaluate")
+    parser.add_argument("--num_passes",  type=int, default=4,
+                        help="Number of full-transformer passes per example for CCoT "
+                             "experiments (must match the value used during training). "
+                             "steps_per_pass = num_steps // num_passes")
     args = parser.parse_args()
 
     if args.hf_cache:
@@ -163,6 +247,7 @@ def main():
     log(f"Tasks:      {tasks}")
     log(f"Steps:      {steps}")
     log(f"Experiments: {args.experiments}")
+    log(f"num_passes: {args.num_passes}")
 
     log("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
@@ -177,14 +262,27 @@ def main():
         log(f"  {label}  (iter={iter_inj!r}, ccot={ccot_inj!r})")
         log(f"{'═'*60}")
 
-        model = load_model(args.model_name, run_dir, subdir, iter_inj, ccot_inj)
         all_results[label] = {}
 
         for num_steps in steps:
-            log(f"\n  → num_steps={num_steps}")
+            # For CCoT experiments, wrap the model so each lm-eval call triggers
+            # num_passes-1 warmup passes internally.  steps_per_pass is derived
+            # from num_steps so that the total recurrent budget matches the
+            # eval_steps sweep (e.g. num_steps=32, num_passes=4 → 8 steps/pass).
+            steps_per_pass = (max(1, num_steps // args.num_passes)
+                              if ccot_inj != "none" and args.num_passes > 1
+                              else None)
+            model = load_model(
+                args.model_name, run_dir, subdir, iter_inj, ccot_inj,
+                num_passes=args.num_passes,
+                steps_per_pass=steps_per_pass,
+            )
+
+            log(f"\n  → num_steps={num_steps}"
+                + (f" ({args.num_passes}×{steps_per_pass})" if steps_per_pass else ""))
             results = run_eval(
                 model, tokenizer, tasks,
-                num_steps=num_steps,
+                num_steps=steps_per_pass if steps_per_pass else num_steps,
                 num_fewshot=args.num_fewshot,
                 batch_size=args.batch_size,
                 limit=args.limit,
@@ -213,8 +311,8 @@ def main():
             )
             log(f"  Saved → {out_path}")
 
-        del model
-        torch.cuda.empty_cache()
+            del model
+            torch.cuda.empty_cache()
 
     # Save combined summary
     summary_path = output_dir / "all_results.json"

@@ -5,14 +5,11 @@
 #SBATCH -qinferno
 #SBATCH -N1 --gres=gpu:A100:1
 #SBATCH --mem=80G
-#SBATCH -t08:00:00
+#SBATCH -t24:00:00
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=hjiang378@gatech.edu
 
 mkdir -p logs
-
-source ~/.bashrc
-conda activate huginn
 
 export HF_HOME=$HOME/scratch/hf_cache
 export TRANSFORMERS_CACHE=$HF_HOME
@@ -21,13 +18,19 @@ mkdir -p $HF_HOME
 
 cd $SLURM_SUBMIT_DIR
 
-python eval_ccot.py \
-    --run_dir    ./runs/ccot_20260413_012258 \
+# ── Set this to the output_dir used when running train_ccot.py ─────────────
+RUN_DIR=./runs/ccot_PLACEHOLDER
+
+PYTHON=$HOME/conda_envs/huginn/bin/python
+$PYTHON eval_ccot.py \
+    --run_dir    $RUN_DIR \
     --model_name tomg-group-umd/huginn-0125 \
     --hf_cache   $HOME/scratch/hf_cache \
-    --tasks      arc_challenge,hellaswag,winogrande,mmlu,gsm8k \
-    --num_steps  8,16,32 \
-    --output_dir ./runs/ccot_20260413_012258/eval \
-    --experiments Baseline iter_only ccot_only both
+    --tasks      arc_challenge,hellaswag,winogrande,gsm8k \
+    --num_steps  32 \
+    --num_passes 4 \
+    --output_dir $RUN_DIR/eval \
+    --batch_size  4 \
+    --experiments ccot_only
 
 echo "Eval finished."

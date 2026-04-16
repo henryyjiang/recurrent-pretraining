@@ -1,26 +1,36 @@
 """
-Huginn CCoT finetuning — HPC script version of finetune_ccot_colab.ipynb
+Huginn CCoT finetuning — HPC script version.
 
 Trains up to three variants of Huginn on GSM8K, evaluates all against the frozen
 baseline, and writes results to an output directory.
+
+CCoT design (ccot_only / both):
+  Each training example is processed in NUM_PASSES sequential full-transformer
+  passes, each using ARGS.num_steps // ARGS.num_passes recurrent steps.  The
+  final loop-block latent state from pass k is detached and injected (via
+  ccot_proj) at the start of every recurrent step of pass k+1.  Loss is only
+  computed on the last pass.  This mirrors latent chain-of-thought: the model
+  re-reads the same question multiple times, refining its internal state before
+  committing to an answer — analogous to CoT token generation but without
+  materialising any tokens.
 
 Usage:
     python train_ccot.py [--experiments iter_only ccot_only both] \\
                          [--output_dir ./runs/ccot_001] \\
                          [--model_name tomg-group-umd/huginn-0125] \\
                          [--hf_cache /scratch/$USER/hf_cache] \\
-                         [--epochs 5] [--lr 3e-4] \\
+                         [--epochs 5] [--lr 3e-4] [--num_passes 4] \\
                          [--no_train_loop] [--skip_eval] [--skip_qualitative]
 
 Output layout:
     <output_dir>/
-        iter_only/          ← saved checkpoint (safetensors + config)
+        iter_only/          ← saved checkpoint (trainable_weights.pt + config)
         ccot_only/
         both/
-        results.csv         ← accuracy table
-        results.txt         ← same table as plain text
+        results.csv
+        results.txt
         accuracy_vs_steps.png
-        qual_outputs.txt    ← qualitative side-by-side
+        qual_outputs.txt
 """
 
 import argparse
@@ -33,12 +43,10 @@ import time
 from pathlib import Path
 from typing import Optional
 
-# ── Make stdout unbuffered so every print appears immediately in .out ──────
 sys.stdout.reconfigure(line_buffering=True)
 
 
 def log(msg: str = ""):
-    """Print with timestamp prefix, always flushed."""
     ts = time.strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
 
@@ -98,10 +106,14 @@ def parse_args():
     p.add_argument("--lr",              type=float, default=3e-4)
     p.add_argument("--batch_size",      type=int,   default=2)
     p.add_argument("--grad_accum",      type=int,   default=16)
-    p.add_argument("--num_steps",       type=int,   default=32)
-    p.add_argument("--backprop_depth",  type=int,   default=8)
+    p.add_argument("--num_steps",       type=int,   default=32,
+                   help="Total recurrent steps per forward pass (or total across all passes for CCoT)")
+    p.add_argument("--num_passes",      type=int,   default=4,
+                   help="Number of full-transformer passes per example for CCoT experiments. "
+                        "steps_per_pass = num_steps // num_passes")
+    p.add_argument("--backprop_depth",  type=int,   default=8,
+                   help="Recurrent steps with gradient per pass (TBPTT depth)")
     p.add_argument("--max_seq_len",     type=int,   default=256)
-    p.add_argument("--window_size",     type=int,   default=4)
     p.add_argument("--warmup_ratio",    type=float, default=0.05)
     p.add_argument("--grad_clip",       type=float, default=1.0)
     p.add_argument("--log_interval",    type=int,   default=20)
@@ -131,7 +143,7 @@ OUTPUT_DIR  = None
 
 
 # ---------------------------------------------------------------------------
-# Dataset
+# Dataset — single-problem only (window chaining removed)
 # ---------------------------------------------------------------------------
 def format_example(q: str, a: str) -> str:
     final = a.split("####")[-1].strip()
@@ -170,41 +182,11 @@ class GSM8KDataset(Dataset):
         return {"input_ids": iids, "labels": labs}
 
 
-class GSM8KWindowDataset(Dataset):
-    def __init__(self, split="train"):
-        self.data   = raw[split]
-        self.wsize  = ARGS.window_size
-        self.starts = list(range(0, len(self.data) - self.wsize, self.wsize))
-
-    def __len__(self):
-        return len(self.starts)
-
-    def __getitem__(self, idx):
-        start  = self.starts[idx]
-        window = []
-        for i in range(start, start + self.wsize):
-            row = self.data[i]
-            iids, labs = tokenize_example(row["question"], row["answer"])
-            window.append({"input_ids": iids, "labels": labs})
-        return window
-
-
 def collate_single(batch):
     return {
         "input_ids": torch.stack([b["input_ids"] for b in batch]),
         "labels":    torch.stack([b["labels"]    for b in batch]),
     }
-
-
-def collate_window(batch):
-    window_size = len(batch[0])
-    return [
-        {
-            "input_ids": torch.stack([b[s]["input_ids"] for b in batch]),
-            "labels":    torch.stack([b[s]["labels"]    for b in batch]),
-        }
-        for s in range(window_size)
-    ]
 
 
 # ---------------------------------------------------------------------------
@@ -246,17 +228,13 @@ def load_model(iter_injection="none", ccot_injection="none", train_loop=True):
 
 
 def save_checkpoint(model, name: str):
-    """Save only the trainable weights + config. Much smaller than a full checkpoint.
-    Base model weights are loaded fresh from HF cache at eval time."""
+    """Save only the trainable weights + config."""
     path = OUTPUT_DIR / name
     path.mkdir(parents=True, exist_ok=True)
 
-    # Trainable weights only
     trainable_state = {k: v for k, v in model.state_dict().items()
                        if any(p.requires_grad for n, p in model.named_parameters() if n == k)}
     torch.save(trainable_state, path / "trainable_weights.pt")
-
-    # Config so we know which injections were active
     model.config.save_pretrained(str(path))
 
     n_params = sum(t.numel() for t in trainable_state.values())
@@ -271,13 +249,11 @@ def load_checkpoint(name: str, iter_injection="none", ccot_injection="none"):
     cfg.iter_injection = iter_injection
     cfg.ccot_injection = ccot_injection
 
-    # Load fresh base model (hits HF cache — no re-download)
     model = AutoModelForCausalLM.from_pretrained(
         ARGS.model_name, config=cfg, torch_dtype=DTYPE,
         device_map=DEVICE, ignore_mismatched_sizes=True,
     )
 
-    # Overlay finetuned weights
     weights_path = path / "trainable_weights.pt"
     if weights_path.exists():
         delta = torch.load(str(weights_path), map_location=DEVICE)
@@ -295,72 +271,96 @@ def load_checkpoint(name: str, iter_injection="none", ccot_injection="none"):
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
-def train(model, experiment_name: str, use_ccot_windows: bool):
+def train(model, experiment_name: str, use_multipass: bool):
+    """
+    use_multipass=False  →  iter_only: single pass, num_steps total, no ccot.
+    use_multipass=True   →  ccot_only / both: ARGS.num_passes sequential passes
+                            over the same example, each with steps_per_pass
+                            recurrent steps.  ccot_memory is chained between
+                            passes (detached).  Loss on final pass only.
+    """
     model.train()
 
-    num_steps_train = torch.tensor(
+    ds     = GSM8KDataset("train")
+    loader = DataLoader(ds, batch_size=ARGS.batch_size, shuffle=True,
+                        collate_fn=collate_single, drop_last=True)
+
+    trainable    = [p for p in model.parameters() if p.requires_grad]
+    optimizer    = torch.optim.AdamW(trainable, lr=ARGS.lr, weight_decay=0.01)
+    total_steps  = len(loader) * ARGS.epochs // ARGS.grad_accum
+    warmup_steps = max(1, int(total_steps * ARGS.warmup_ratio))
+    scheduler    = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+
+    # TBPTT split for a single pass (iter_only uses full num_steps)
+    num_steps_single = torch.tensor(
         [ARGS.num_steps - ARGS.backprop_depth, ARGS.backprop_depth]
     )
 
-    if use_ccot_windows:
-        ds     = GSM8KWindowDataset("train")
-        loader = DataLoader(ds, batch_size=ARGS.batch_size, shuffle=True,
-                            collate_fn=collate_window, drop_last=True)
+    # Per-pass step counts for CCoT (steps_per_pass = num_steps // num_passes)
+    if use_multipass:
+        steps_per_pass = max(1, ARGS.num_steps // ARGS.num_passes)
+        no_grad_pass   = max(0, steps_per_pass - ARGS.backprop_depth)
+        with_grad_pass = steps_per_pass - no_grad_pass
+        num_steps_pass = torch.tensor([no_grad_pass, with_grad_pass])
+        log(f"  CCoT: {ARGS.num_passes} passes × {steps_per_pass} steps/pass "
+            f"(no-grad={no_grad_pass}, grad={with_grad_pass} per pass)")
     else:
-        ds     = GSM8KDataset("train")
-        loader = DataLoader(ds, batch_size=ARGS.batch_size, shuffle=True,
-                            collate_fn=collate_single, drop_last=True)
+        log(f"  Single pass: {ARGS.num_steps} steps "
+            f"(no-grad={ARGS.num_steps - ARGS.backprop_depth}, "
+            f"grad={ARGS.backprop_depth})")
 
-    trainable     = [p for p in model.parameters() if p.requires_grad]
-    optimizer     = torch.optim.AdamW(trainable, lr=ARGS.lr, weight_decay=0.01)
-    total_steps   = len(loader) * ARGS.epochs // ARGS.grad_accum
-    warmup_steps  = max(1, int(total_steps * ARGS.warmup_ratio))
-    scheduler     = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-
-    global_step  = 0
-    accum_loss   = 0.0
-    accum_count  = 0
+    # output_details: always return latents (needed for ccot chaining)
     output_details = {
         "return_logits": False, "return_latents": True,
         "return_head":   False, "return_stats":   False,
     }
+
+    global_step  = 0
+    accum_loss   = 0.0
+    accum_count  = 0
 
     log(f"\n{'═'*60}")
     log(f"  Training: {experiment_name}")
     log(f"{'═'*60}")
     log(f"  Epochs={ARGS.epochs}  Steps/epoch={len(loader)}  "
         f"Effective batch={ARGS.batch_size * ARGS.grad_accum}  LR={ARGS.lr}")
-    log(f"  num_steps={ARGS.num_steps}  backprop_depth={ARGS.backprop_depth}  "
-        f"(no-grad={ARGS.num_steps - ARGS.backprop_depth}, grad={ARGS.backprop_depth})")
 
     for epoch in range(ARGS.epochs):
         for batch_idx, batch in enumerate(loader):
+            iids   = batch["input_ids"].to(DEVICE)
+            labels = batch["labels"].to(DEVICE)
 
-            if not use_ccot_windows:
-                iids   = batch["input_ids"].to(DEVICE)
-                labels = batch["labels"].to(DEVICE)
-                out    = model(
+            if not use_multipass:
+                # ── iter_only: single standard pass ──────────────────────────
+                out  = model(
                     input_ids=iids, labels=labels,
-                    num_steps=num_steps_train,
+                    num_steps=num_steps_single,
                     output_details=output_details,
                 )
                 loss = out.loss / ARGS.grad_accum
 
             else:
+                # ── CCoT: num_passes sequential passes on the same example ──
+                # Pass 0 .. num_passes-2: no labels, save latent → ccot_memory
+                # Pass num_passes-1: labels provided, compute loss
+                # Gradient is cut between passes (detach); each pass only
+                # backprops through its own recurrent steps (TBPTT via
+                # num_steps_pass).
                 ccot_memory = None
-                window_loss = torch.tensor(0.0, device=DEVICE)
-                for step_batch in batch:
-                    iids   = step_batch["input_ids"].to(DEVICE)
-                    labels = step_batch["labels"].to(DEVICE)
-                    out    = model(
-                        input_ids=iids, labels=labels,
-                        num_steps=num_steps_train,
+                for p in range(ARGS.num_passes):
+                    is_final = (p == ARGS.num_passes - 1)
+                    out = model(
+                        input_ids=iids,
+                        labels=labels if is_final else None,
+                        num_steps=num_steps_pass,
                         ccot_memory=ccot_memory,
                         output_details=output_details,
                     )
-                    window_loss = window_loss + out.loss
+                    # Detach: gradients do not flow back through pass boundaries.
+                    # out.latent_states is always populated (set before loss
+                    # computation in the model's forward, independent of labels).
                     ccot_memory = out.latent_states.detach()
-                loss = (window_loss / len(batch)) / ARGS.grad_accum
+                loss = out.loss / ARGS.grad_accum
 
             loss.backward()
             accum_loss  += loss.item() * ARGS.grad_accum
@@ -397,13 +397,24 @@ def extract_number(text: str) -> Optional[str]:
 
 
 @torch.no_grad()
-def evaluate_model(model, use_ccot: bool = False):
+def evaluate_model(model, use_multipass: bool = False):
+    """
+    use_multipass=True:  for each example, run num_passes-1 warmup passes
+                         (chaining ccot_memory), then generate on the final
+                         pass with the accumulated memory.  ccot_memory resets
+                         between examples — there is no cross-question chaining.
+    """
     test_data = raw["test"].select(range(ARGS.n_eval))
     results   = {s: {"correct": 0, "total": 0} for s in ARGS.eval_steps}
 
+    latent_od = {"return_logits": False, "return_latents": True,
+                 "return_head":   False, "return_stats":   False}
+
     for num_steps in ARGS.eval_steps:
-        log(f"    evaluating steps={num_steps} ...")
-        ccot_memory = None
+        steps_per_pass = (max(1, num_steps // ARGS.num_passes)
+                          if use_multipass else num_steps)
+        log(f"    evaluating steps={num_steps} "
+            f"({'×'.join([str(ARGS.num_passes), str(steps_per_pass)]) if use_multipass else 'single pass'}) ...")
 
         for row in test_data:
             gold   = extract_number(row["answer"].split("####")[-1])
@@ -413,25 +424,35 @@ def evaluate_model(model, use_ccot: bool = False):
             iids  = enc["input_ids"].to(DEVICE)
             amask = enc["attention_mask"].to(DEVICE)
 
-            out = model.generate(
-                input_ids=iids, attention_mask=amask,
-                max_new_tokens=32, num_steps=num_steps, do_sample=False,
-            )
+            if use_multipass:
+                # Warmup passes (no generation, just build up ccot_memory)
+                ccot_memory = None
+                for _ in range(ARGS.num_passes - 1):
+                    fwd = model(
+                        input_ids=iids,
+                        num_steps=steps_per_pass,
+                        ccot_memory=ccot_memory,
+                        output_details=latent_od,
+                    )
+                    ccot_memory = fwd.latent_states.detach()
+
+                # Final pass: generate with accumulated ccot_memory
+                out = model.generate(
+                    input_ids=iids, attention_mask=amask,
+                    max_new_tokens=32, num_steps=steps_per_pass,
+                    ccot_memory=ccot_memory, do_sample=False,
+                )
+            else:
+                out = model.generate(
+                    input_ids=iids, attention_mask=amask,
+                    max_new_tokens=32, num_steps=num_steps, do_sample=False,
+                )
+
             generated = tokenizer.decode(out[0][iids.shape[1]:], skip_special_tokens=True)
-            pred = extract_number(generated)
+            pred      = extract_number(generated)
 
             results[num_steps]["correct"] += int(pred == gold)
             results[num_steps]["total"]   += 1
-
-            if use_ccot:
-                fwd = model(
-                    input_ids=iids,
-                    num_steps=num_steps,
-                    ccot_memory=ccot_memory,
-                    output_details={"return_logits": False, "return_latents": True,
-                                    "return_head": False,  "return_stats": False},
-                )
-                ccot_memory = fwd.latent_states.detach()
 
     return {s: r["correct"] / r["total"] for s, r in results.items()}
 
@@ -447,12 +468,29 @@ QUAL_PROMPTS = [
 
 
 @torch.no_grad()
-def quick_generate(model, prompt: str, num_steps: int = 16) -> str:
+def quick_generate(model, prompt: str, num_steps: int = 16,
+                   use_multipass: bool = False) -> str:
     enc   = tokenizer(prompt, return_tensors="pt")
     iids  = enc["input_ids"].to(DEVICE)
     amask = enc["attention_mask"].to(DEVICE)
-    out   = model.generate(input_ids=iids, attention_mask=amask,
-                           max_new_tokens=40, num_steps=num_steps, do_sample=False)
+
+    if use_multipass:
+        steps_per_pass = max(1, num_steps // ARGS.num_passes)
+        latent_od = {"return_logits": False, "return_latents": True,
+                     "return_head":   False, "return_stats":   False}
+        ccot_memory = None
+        for _ in range(ARGS.num_passes - 1):
+            fwd = model(input_ids=iids, num_steps=steps_per_pass,
+                        ccot_memory=ccot_memory, output_details=latent_od)
+            ccot_memory = fwd.latent_states.detach()
+        out = model.generate(input_ids=iids, attention_mask=amask,
+                             max_new_tokens=40, num_steps=steps_per_pass,
+                             ccot_memory=ccot_memory, do_sample=False)
+    else:
+        out = model.generate(input_ids=iids, attention_mask=amask,
+                             max_new_tokens=40, num_steps=num_steps,
+                             do_sample=False)
+
     return tokenizer.decode(out[0][iids.shape[1]:], skip_special_tokens=True).strip()
 
 
@@ -460,7 +498,6 @@ def quick_generate(model, prompt: str, num_steps: int = 16) -> str:
 # Results I/O
 # ---------------------------------------------------------------------------
 def save_results(all_results: dict):
-    # Plain-text table
     steps = ARGS.eval_steps
     col_w = 10
     header = f"{'Model':<16}" + "".join(f"{'steps='+str(s):>{col_w}}" for s in steps)
@@ -476,7 +513,6 @@ def save_results(all_results: dict):
     txt_path.write_text(table + "\n")
     log(f"  Saved → {txt_path}")
 
-    # CSV
     try:
         import csv
         csv_path = OUTPUT_DIR / "results.csv"
@@ -489,23 +525,21 @@ def save_results(all_results: dict):
     except Exception as e:
         log(f"  WARNING: CSV save failed: {e}")
 
-    # JSON (machine-readable)
     json_path = OUTPUT_DIR / "results.json"
     json_path.write_text(json.dumps(all_results, indent=2))
     log(f"  Saved → {json_path}")
 
-    # Plot
     try:
         import matplotlib
-        matplotlib.use("Agg")  # non-interactive — required on HPC
+        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
         fig, ax = plt.subplots(figsize=(8, 5))
         styles = {
-            "Baseline":  ("black",      "--"),
-            "iter_only": ("royalblue",  "-"),
-            "ccot_only": ("tomato",     "-"),
-            "both":      ("seagreen",   "-"),
+            "Baseline":  ("black",     "--"),
+            "iter_only": ("royalblue", "-"),
+            "ccot_only": ("tomato",    "-"),
+            "both":      ("seagreen",  "-"),
         }
         for label, res in all_results.items():
             xs = sorted(res.keys())
@@ -513,7 +547,7 @@ def save_results(all_results: dict):
             color, ls = styles.get(label, ("gray", "-"))
             ax.plot(xs, ys, marker="o", label=label, color=color, linestyle=ls)
 
-        ax.set_xlabel("num_steps (recurrence depth)")
+        ax.set_xlabel("num_steps (total recurrent steps)")
         ax.set_ylabel("Accuracy (%) on GSM8K test")
         ax.set_title("Huginn CCoT — Accuracy vs Recurrence Depth")
         ax.legend()
@@ -553,8 +587,8 @@ def main():
     log(f"Output dir: {OUTPUT_DIR}")
     log(f"Experiments: {ARGS.experiments}")
     log(f"train_loop: {not ARGS.no_train_loop}")
+    log(f"num_passes: {ARGS.num_passes}  steps_per_pass: {ARGS.num_steps // ARGS.num_passes}")
 
-    # Save run config for reproducibility
     (OUTPUT_DIR / "run_config.json").write_text(
         json.dumps(vars(ARGS), indent=2, default=str)
     )
@@ -569,7 +603,11 @@ def main():
     train_loop = not ARGS.no_train_loop
 
     # ── Experiment definitions ─────────────────────────────────────────────
-    # (name, iter_injection, ccot_injection, use_ccot_windows)
+    # (iter_injection, ccot_injection, use_multipass)
+    #   use_multipass=True  → num_passes sequential passes over one example,
+    #                         ccot_memory chained between passes (single-problem
+    #                         latent CoT).
+    #   use_multipass=False → standard single-pass (iter_only).
     experiment_configs = {
         "iter_only":  ("add",  "none", False),
         "ccot_only":  ("none", "add",  True),
@@ -578,10 +616,10 @@ def main():
 
     # ── Training ──────────────────────────────────────────────────────────
     for name in ARGS.experiments:
-        iter_inj, ccot_inj, use_windows = experiment_configs[name]
+        iter_inj, ccot_inj, use_multipass = experiment_configs[name]
         log(f"\nLoading model for {name}...")
         model = load_model(iter_inj, ccot_inj, train_loop=train_loop)
-        train(model, name, use_windows)
+        train(model, name, use_multipass)
         del model
         torch.cuda.empty_cache()
         log(f"{name} done.")
@@ -592,15 +630,13 @@ def main():
         log("  EVALUATION")
         log("═" * 60)
 
-        # Always include baseline
         eval_experiments = [("Baseline", "none", "none", None, False)]
         for name in ARGS.experiments:
-            iter_inj, ccot_inj, _ = experiment_configs[name]
-            use_ccot_eval = (ccot_inj != "none")
-            eval_experiments.append((name, iter_inj, ccot_inj, name, use_ccot_eval))
+            iter_inj, ccot_inj, use_multipass = experiment_configs[name]
+            eval_experiments.append((name, iter_inj, ccot_inj, name, use_multipass))
 
         all_results = {}
-        for label, iter_inj, ccot_inj, ckpt_name, use_ccot_eval in eval_experiments:
+        for label, iter_inj, ccot_inj, ckpt_name, use_multipass in eval_experiments:
             log(f"\nEvaluating: {label}")
 
             if ckpt_name is None:
@@ -613,7 +649,7 @@ def main():
             else:
                 model = load_checkpoint(ckpt_name, iter_inj, ccot_inj)
 
-            res = evaluate_model(model, use_ccot=use_ccot_eval)
+            res = evaluate_model(model, use_multipass=use_multipass)
             all_results[label] = res
 
             for steps, acc in res.items():
@@ -631,11 +667,10 @@ def main():
         log("  QUALITATIVE COMPARISON (num_steps=16)")
         log("═" * 60)
 
-        # Re-build eval_experiments list in case eval was skipped
-        qual_experiments = [("Baseline", "none", "none", None)]
+        qual_experiments = [("Baseline", "none", "none", None, False)]
         for name in ARGS.experiments:
-            iter_inj, ccot_inj, _ = experiment_configs[name]
-            qual_experiments.append((name, iter_inj, ccot_inj, name))
+            iter_inj, ccot_inj, use_multipass = experiment_configs[name]
+            qual_experiments.append((name, iter_inj, ccot_inj, name, use_multipass))
 
         qual_lines = []
         for prompt in QUAL_PROMPTS:
@@ -644,7 +679,7 @@ def main():
             log("-" * 70)
             qual_lines.extend([header, "-" * 70])
 
-            for label, iter_inj, ccot_inj, ckpt_name in qual_experiments:
+            for label, iter_inj, ccot_inj, ckpt_name, use_multipass in qual_experiments:
                 if ckpt_name is None:
                     cfg = RavenConfig.from_pretrained(ARGS.model_name)
                     m   = AutoModelForCausalLM.from_pretrained(
@@ -655,7 +690,8 @@ def main():
                     m = load_checkpoint(ckpt_name, iter_inj, ccot_inj)
                 m.eval()
 
-                ans  = quick_generate(m, prompt, num_steps=16)
+                ans  = quick_generate(m, prompt, num_steps=16,
+                                      use_multipass=use_multipass)
                 line = f"  [{label:<12}] {ans[:120]}"
                 log(line)
                 qual_lines.append(line)
