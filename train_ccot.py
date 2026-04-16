@@ -115,6 +115,7 @@ def parse_args():
                    help="Recurrent steps with gradient per pass (TBPTT depth)")
     p.add_argument("--max_seq_len",     type=int,   default=256)
     p.add_argument("--warmup_ratio",    type=float, default=0.05)
+    p.add_argument("--weight_decay",    type=float, default=0.1)
     p.add_argument("--grad_clip",       type=float, default=1.0)
     p.add_argument("--log_interval",    type=int,   default=20)
     # Flags
@@ -286,7 +287,7 @@ def train(model, experiment_name: str, use_multipass: bool):
                         collate_fn=collate_single, drop_last=True)
 
     trainable    = [p for p in model.parameters() if p.requires_grad]
-    optimizer    = torch.optim.AdamW(trainable, lr=ARGS.lr, weight_decay=0.01)
+    optimizer    = torch.optim.AdamW(trainable, lr=ARGS.lr, weight_decay=ARGS.weight_decay)
     total_steps  = len(loader) * ARGS.epochs // ARGS.grad_accum
     warmup_steps = max(1, int(total_steps * ARGS.warmup_ratio))
     scheduler    = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)

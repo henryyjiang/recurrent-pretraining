@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -J huginn_ccot
 #SBATCH -A gts-vfung3
-#SBATCH -o logs/huginn_ccot_%j.out
+#SBATCH -o logs/ccot_%j.out
 #SBATCH -qinferno
 #SBATCH -N1 --gres=gpu:A100:1
 #SBATCH --mem=80G
@@ -28,18 +28,22 @@ cd $SLURM_SUBMIT_DIR
 # ── Run ──────────────────────────────────────────────────────────────────
 RUN_ID=$(date +%Y%m%d_%H%M%S)
 
-python train_ccot.py \
-    --experiments iter_only ccot_only both \
+PYTHON=$HOME/conda_envs/huginn/bin/python
+$PYTHON train_ccot.py \
+    --experiments ccot_only \
     --output_dir  ./runs/ccot_${RUN_ID} \
     --model_name  tomg-group-umd/huginn-0125 \
     --hf_cache    $HOME/scratch/hf_cache \
-    --epochs      5 \
+    --epochs      1 \
     --lr          1e-4 \
+    --weight_decay 0.1 \
     --batch_size  1 \
     --grad_accum  32 \
     --num_steps   32 \
     --backprop_depth 4 \
     --grad_checkpoint \
-    --n_eval      200
+    --no_train_loop \
+    --skip_eval \
+    --skip_qualitative
 
 echo "Job finished: $RUN_ID"

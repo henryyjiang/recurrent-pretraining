@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -J huginn_eval
 #SBATCH -A gts-vfung3
-#SBATCH -o logs/huginn_eval_%j.out
+#SBATCH -o logs/eval_%j.out
 #SBATCH -qinferno
 #SBATCH -N1 --gres=gpu:A100:1
 #SBATCH --mem=80G
