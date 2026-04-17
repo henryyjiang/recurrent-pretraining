@@ -128,6 +128,9 @@ def parse_args():
                    choices=["gsm8k", "winogrande_hellaswag"],
                    help="Training dataset. winogrande_hellaswag mixes both train splits "
                         "for broader coverage and reduced task-specific overfitting.")
+    p.add_argument("--max_train_samples", type=int, default=None,
+                   help="Cap total training examples (None = use full dataset). "
+                        "For winogrande_hellaswag, split evenly between the two datasets.")
     p.add_argument("--skip_eval",       action="store_true")
     p.add_argument("--skip_qualitative",action="store_true")
     p.add_argument("--n_eval",          type=int,   default=200)
@@ -223,15 +226,28 @@ class WinoGrandeDataset(Dataset):
 
 def build_train_dataset() -> Dataset:
     if ARGS.dataset == "gsm8k":
-        return GSM8KDataset("train")
-    # winogrande_hellaswag: ~80K diverse examples across two tasks
-    from torch.utils.data import ConcatDataset
+        ds = GSM8KDataset("train")
+        if ARGS.max_train_samples:
+            ds = torch.utils.data.Subset(ds, range(min(ARGS.max_train_samples, len(ds))))
+        return ds
+
+    # winogrande_hellaswag: cap each dataset to half of max_train_samples
+    from torch.utils.data import ConcatDataset, Subset
+    per_dataset = (ARGS.max_train_samples // 2
+                   if ARGS.max_train_samples else None)
+
     log("  Loading HellaSwag train...")
     hs = HellaSwagDataset("train")
+    if per_dataset:
+        hs = Subset(hs, range(min(per_dataset, len(hs))))
     log(f"    {len(hs):,} examples")
+
     log("  Loading WinoGrande train (xl)...")
     wg = WinoGrandeDataset("train")
+    if per_dataset:
+        wg = Subset(wg, range(min(per_dataset, len(wg))))
     log(f"    {len(wg):,} examples")
+
     combined = ConcatDataset([hs, wg])
     log(f"  Combined: {len(combined):,} examples")
     return combined

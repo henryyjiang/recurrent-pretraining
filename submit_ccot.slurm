@@ -35,6 +35,7 @@ $PYTHON train_ccot.py \
     --model_name  tomg-group-umd/huginn-0125 \
     --hf_cache    $HOME/scratch/hf_cache \
     --dataset     winogrande_hellaswag \
+    --max_train_samples 32000 \
     --epochs      3 \
     --lr          1e-4 \
     --weight_decay 0.1 \
