@@ -125,9 +125,13 @@ def parse_args():
                    help="Enable gradient checkpointing (saves memory, slower)")
     # Eval
     p.add_argument("--dataset",         default="winogrande_hellaswag",
-                   choices=["gsm8k", "winogrande_hellaswag"],
+                   choices=["gsm8k", "winogrande_hellaswag", "pretrain_sample"],
                    help="Training dataset. winogrande_hellaswag mixes both train splits "
-                        "for broader coverage and reduced task-specific overfitting.")
+                        "for broader coverage and reduced task-specific overfitting. "
+                        "pretrain_sample loads from data/pretrain_samples.jsonl (built by "
+                        "scripts/build_pretrain_sample_dataset.py).")
+    p.add_argument("--pretrain_sample_path", default="data/pretrain_samples.jsonl",
+                   help="Path to pretrain sample JSONL for --dataset pretrain_sample")
     p.add_argument("--max_train_samples", type=int, default=None,
                    help="Cap total training examples (None = use full dataset). "
                         "For winogrande_hellaswag, split evenly between the two datasets.")
@@ -224,7 +228,32 @@ class WinoGrandeDataset(Dataset):
         return {"input_ids": iids, "labels": labs}
 
 
+class PretrainSampleDataset(Dataset):
+    """Samples from Huginn's pretraining distribution (Wikipedia, Cosmopedia, arXiv, etc.).
+    Load from JSONL built by scripts/build_pretrain_sample_dataset.py."""
+
+    def __init__(self, path: str):
+        import json as _json
+        with open(path) as f:
+            self.data = [_json.loads(line)["text"] for line in f if line.strip()]
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        iids, labs = tokenize_text(self.data[idx])
+        return {"input_ids": iids, "labels": labs}
+
+
 def build_train_dataset() -> Dataset:
+    if ARGS.dataset == "pretrain_sample":
+        log(f"  Loading pretrain samples from {ARGS.pretrain_sample_path}...")
+        ds = PretrainSampleDataset(ARGS.pretrain_sample_path)
+        if ARGS.max_train_samples:
+            ds = torch.utils.data.Subset(ds, range(min(ARGS.max_train_samples, len(ds))))
+        log(f"    {len(ds):,} examples")
+        return ds
+
     if ARGS.dataset == "gsm8k":
         ds = GSM8KDataset("train")
         if ARGS.max_train_samples:
