@@ -124,6 +124,10 @@ def parse_args():
     p.add_argument("--grad_checkpoint", action="store_true",
                    help="Enable gradient checkpointing (saves memory, slower)")
     # Eval
+    p.add_argument("--dataset",         default="winogrande_hellaswag",
+                   choices=["gsm8k", "winogrande_hellaswag"],
+                   help="Training dataset. winogrande_hellaswag mixes both train splits "
+                        "for broader coverage and reduced task-specific overfitting.")
     p.add_argument("--skip_eval",       action="store_true")
     p.add_argument("--skip_qualitative",action="store_true")
     p.add_argument("--n_eval",          type=int,   default=200)
@@ -139,34 +143,38 @@ ARGS        = None
 DEVICE      = "cuda"
 DTYPE       = torch.bfloat16
 tokenizer   = None
-raw         = None   # HuggingFace dataset dict
+raw         = None   # HuggingFace dataset dict (GSM8K only, for eval)
 OUTPUT_DIR  = None
 
 
 # ---------------------------------------------------------------------------
-# Dataset — single-problem only (window chaining removed)
+# Dataset
 # ---------------------------------------------------------------------------
-def format_example(q: str, a: str) -> str:
-    final = a.split("####")[-1].strip()
-    return f"Question: {q.strip()}\nAnswer: {final}"
+def tokenize_text(text: str):
+    """Causal LM tokenization: loss on all non-padding tokens."""
+    ids     = tokenizer(text, add_special_tokens=True).input_ids[:ARGS.max_seq_len]
+    pad_id  = tokenizer.pad_token_id or 0
+    pad_len = ARGS.max_seq_len - len(ids)
+    input_ids = ids + [pad_id] * pad_len
+    labels    = ids + [-100]   * pad_len
+    return torch.tensor(input_ids), torch.tensor(labels)
 
 
 def tokenize_example(q: str, a: str):
-    text   = format_example(q, a)
+    """GSM8K tokenization: loss on answer tokens only."""
+    text   = f"Question: {q.strip()}\nAnswer: {a.split('####')[-1].strip()}"
     q_text = f"Question: {q.strip()}\nAnswer:"
 
-    full_ids = tokenizer(text,   add_special_tokens=True).input_ids
+    full_ids = tokenizer(text,   add_special_tokens=True).input_ids[:ARGS.max_seq_len]
     q_ids    = tokenizer(q_text, add_special_tokens=True).input_ids
 
-    full_ids = full_ids[:ARGS.max_seq_len]
-    labels   = [-100] * len(q_ids) + full_ids[len(q_ids):]
-    labels   = labels[:ARGS.max_seq_len]
+    labels  = [-100] * len(q_ids) + full_ids[len(q_ids):]
+    labels  = labels[:ARGS.max_seq_len]
 
     pad_id  = tokenizer.pad_token_id or 0
     pad_len = ARGS.max_seq_len - len(full_ids)
     input_ids = full_ids + [pad_id] * pad_len
     labels    = labels   + [-100]   * pad_len
-
     return torch.tensor(input_ids), torch.tensor(labels)
 
 
@@ -181,6 +189,52 @@ class GSM8KDataset(Dataset):
         row = self.data[idx]
         iids, labs = tokenize_example(row["question"], row["answer"])
         return {"input_ids": iids, "labels": labs}
+
+
+class HellaSwagDataset(Dataset):
+    def __init__(self, split="train"):
+        self.data = load_dataset("Rowan/hellaswag", split=split)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        ex      = self.data[idx]
+        correct = ex["endings"][int(ex["label"])]
+        text    = f"{ex['ctx']} {correct}"
+        iids, labs = tokenize_text(text)
+        return {"input_ids": iids, "labels": labs}
+
+
+class WinoGrandeDataset(Dataset):
+    def __init__(self, split="train"):
+        self.data = load_dataset("winogrande", "winogrande_xl", split=split)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        ex      = self.data[idx]
+        correct = ex["option1"] if ex["answer"] == "1" else ex["option2"]
+        text    = ex["sentence"].replace("_", correct)
+        iids, labs = tokenize_text(text)
+        return {"input_ids": iids, "labels": labs}
+
+
+def build_train_dataset() -> Dataset:
+    if ARGS.dataset == "gsm8k":
+        return GSM8KDataset("train")
+    # winogrande_hellaswag: ~80K diverse examples across two tasks
+    from torch.utils.data import ConcatDataset
+    log("  Loading HellaSwag train...")
+    hs = HellaSwagDataset("train")
+    log(f"    {len(hs):,} examples")
+    log("  Loading WinoGrande train (xl)...")
+    wg = WinoGrandeDataset("train")
+    log(f"    {len(wg):,} examples")
+    combined = ConcatDataset([hs, wg])
+    log(f"  Combined: {len(combined):,} examples")
+    return combined
 
 
 def collate_single(batch):
@@ -282,7 +336,7 @@ def train(model, experiment_name: str, use_multipass: bool):
     """
     model.train()
 
-    ds     = GSM8KDataset("train")
+    ds     = build_train_dataset()
     loader = DataLoader(ds, batch_size=ARGS.batch_size, shuffle=True,
                         collate_fn=collate_single, drop_last=True)
 
@@ -597,9 +651,11 @@ def main():
     log("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(ARGS.model_name)
 
-    log("Loading dataset (GSM8K)...")
-    raw = load_dataset("openai/gsm8k", "main")
-    log(f"  Train: {len(raw['train'])}  |  Test: {len(raw['test'])}")
+    log(f"Dataset: {ARGS.dataset}")
+    if ARGS.dataset == "gsm8k" or not ARGS.skip_eval:
+        log("Loading GSM8K (needed for eval)...")
+        raw = load_dataset("openai/gsm8k", "main")
+        log(f"  Train: {len(raw['train'])}  |  Test: {len(raw['test'])}")
 
     train_loop = not ARGS.no_train_loop
 

@@ -823,7 +823,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
                 ccot_memory.mean(dim=1, keepdim=True)   # [B, 1, E]
             )
             ccot_summary = torch.nn.functional.dropout(
-                ccot_summary, p=0.3, training=self.training
+                ccot_summary, p=0.5, training=self.training
             )
             if self.config.ccot_injection == "add":
                 # Broadcast-add across all sequence positions.

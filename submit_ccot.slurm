@@ -34,7 +34,8 @@ $PYTHON train_ccot.py \
     --output_dir  ./runs/ccot_${RUN_ID} \
     --model_name  tomg-group-umd/huginn-0125 \
     --hf_cache    $HOME/scratch/hf_cache \
-    --epochs      1 \
+    --dataset     winogrande_hellaswag \
+    --epochs      3 \
     --lr          1e-4 \
     --weight_decay 0.1 \
     --batch_size  1 \
