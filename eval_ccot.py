@@ -139,10 +139,12 @@ EXPERIMENTS = [
 
 
 def load_model(model_name, run_dir, subdir, iter_injection, ccot_injection,
-               num_passes: int = 1, steps_per_pass: Optional[int] = None):
+               num_passes: int = 1, steps_per_pass: Optional[int] = None,
+               proj_bottleneck_dim: int = 0):
     cfg = RavenConfig.from_pretrained(model_name)
     cfg.iter_injection = iter_injection
     cfg.ccot_injection = ccot_injection
+    cfg.proj_bottleneck_dim = proj_bottleneck_dim
 
     log(f"  Loading base model from HF cache...")
     model = AutoModelForCausalLM.from_pretrained(
@@ -228,6 +230,8 @@ def main():
                         help="Number of full-transformer passes per example for CCoT "
                              "experiments (must match the value used during training). "
                              "steps_per_pass = num_steps // num_passes")
+    parser.add_argument("--proj_bottleneck_dim", type=int, default=0,
+                        help="Must match the value used during training (0 = full-rank)")
     args = parser.parse_args()
 
     if args.hf_cache:
@@ -276,6 +280,7 @@ def main():
                 args.model_name, run_dir, subdir, iter_inj, ccot_inj,
                 num_passes=args.num_passes,
                 steps_per_pass=steps_per_pass,
+                proj_bottleneck_dim=args.proj_bottleneck_dim,
             )
 
             log(f"\n  → num_steps={num_steps}"
