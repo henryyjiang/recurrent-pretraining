@@ -36,6 +36,7 @@ class RavenConfig(PretrainedConfig):
         mean_backprop_depth: int = 8,
         iter_injection: str = "none",   # within-query, iteration-to-iteration: "none" | "add" | "prepend"
         ccot_injection: str = "none",   # cross-query episodic memory:           "none" | "add" | "prepend"
+        proj_bottleneck_dim: int = 0,   # 0 = full-rank Linear(n_embd, n_embd); >0 = bottleneck dim
         n_layers_in_prelude: int = 2,
         n_layers_in_coda: int = 2,
         qk_bias: bool = True,
@@ -70,6 +71,7 @@ class RavenConfig(PretrainedConfig):
         self.mean_backprop_depth = mean_backprop_depth
         self.iter_injection = iter_injection
         self.ccot_injection = ccot_injection
+        self.proj_bottleneck_dim = proj_bottleneck_dim
         self.n_layers_in_prelude = n_layers_in_prelude
         self.n_layers_in_coda = n_layers_in_coda
         self.qk_bias = qk_bias

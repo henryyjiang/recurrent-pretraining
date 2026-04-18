@@ -107,11 +107,27 @@ class RavenPreTrainedModel(PreTrainedModel):
                 self._normal_(module.weight, std=float(_init_values["out_proj"]))
             elif "adapter" in name or "lm_head" in name:
                 self._normal_(module.weight, std=float(_init_values["std"]))
-            elif "iter_proj" in name or "ccot_proj" in name:
+            elif ("iter_proj" in name or "ccot_proj" in name) and ".down" not in name:
                 # Zero init so both injection modes start as no-ops.
+                # For bottleneck projections only zero the `up` layer; `down` keeps
+                # normal init so gradients reach it once `up` becomes nonzero.
                 torch.nn.init.zeros_(module.weight)
         elif isinstance(module, torch.nn.Embedding):
             self._normal_(module.weight, std=float(_init_values["embedding"]))
+
+
+class BottleneckProj(torch.nn.Module):
+    """Low-rank bottleneck projection: Linear(n_embd→dim) → Linear(dim→n_embd).
+    up is zero-initialized so the projection starts as a no-op."""
+
+    def __init__(self, n_embd: int, bottleneck_dim: int):
+        super().__init__()
+        self.down = torch.nn.Linear(n_embd, bottleneck_dim, bias=False)
+        self.up   = torch.nn.Linear(bottleneck_dim, n_embd, bias=False)
+        torch.nn.init.zeros_(self.up.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.up(self.down(x))
 
 
 @dataclass
@@ -568,8 +584,13 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         # it into the current query (cross-query episodic memory).
         # Both are zero-initialized so the respective modes start as no-ops and
         # finetuning begins from the original model's behavior.
-        iter_proj = torch.nn.Linear(config.n_embd, config.n_embd, bias=False)
-        ccot_proj = torch.nn.Linear(config.n_embd, config.n_embd, bias=False)
+        _bdim = getattr(config, "proj_bottleneck_dim", 0)
+        if _bdim > 0:
+            iter_proj = BottleneckProj(config.n_embd, _bdim)
+            ccot_proj = BottleneckProj(config.n_embd, _bdim)
+        else:
+            iter_proj = torch.nn.Linear(config.n_embd, config.n_embd, bias=False)
+            ccot_proj = torch.nn.Linear(config.n_embd, config.n_embd, bias=False)
 
         self.transformer = torch.nn.ModuleDict(
             dict(

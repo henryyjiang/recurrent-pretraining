@@ -132,6 +132,8 @@ def parse_args():
                         "scripts/build_pretrain_sample_dataset.py).")
     p.add_argument("--pretrain_sample_path", default="data/pretrain_samples.jsonl",
                    help="Path to pretrain sample JSONL for --dataset pretrain_sample")
+    p.add_argument("--proj_bottleneck_dim", type=int, default=0,
+                   help="Bottleneck dim for iter_proj/ccot_proj (0 = full-rank 5280x5280)")
     p.add_argument("--max_train_samples", type=int, default=None,
                    help="Cap total training examples (None = use full dataset). "
                         "For winogrande_hellaswag, split evenly between the two datasets.")
@@ -296,6 +298,7 @@ def load_model(iter_injection="none", ccot_injection="none", train_loop=True):
     cfg = RavenConfig.from_pretrained(ARGS.model_name)
     cfg.iter_injection = iter_injection
     cfg.ccot_injection = ccot_injection
+    cfg.proj_bottleneck_dim = ARGS.proj_bottleneck_dim
 
     model = AutoModelForCausalLM.from_pretrained(
         ARGS.model_name,
@@ -348,6 +351,7 @@ def load_checkpoint(name: str, iter_injection="none", ccot_injection="none"):
     cfg  = RavenConfig.from_pretrained(str(path))
     cfg.iter_injection = iter_injection
     cfg.ccot_injection = ccot_injection
+    cfg.proj_bottleneck_dim = ARGS.proj_bottleneck_dim
 
     model = AutoModelForCausalLM.from_pretrained(
         ARGS.model_name, config=cfg, torch_dtype=DTYPE,
