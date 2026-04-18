@@ -20,17 +20,17 @@ from datasets import load_dataset
 
 SOURCES = [
     # (hf_id, config, split, text_field, weight, label)
-    ("euirim/goodwiki",                          None,            "train", "text",    4.0, "wikipedia"),
-    ("HuggingFaceTB/smollm-corpus",              "cosmopedia-v2", "train", "text",    2.0, "cosmopedia"),
-    ("togethercomputer/RedPajama-Data-1T",        "arxiv",         "train", "text",    2.0, "arxiv"),
-    ("togethercomputer/RedPajama-Data-1T",        "stackexchange", "train", "text",    1.0, "stackexchange"),
-    ("HuggingFaceTB/smollm-corpus",              "fineweb-edu-dedup", "train", "text", 1.0, "fineweb_edu"),
+    # wikimedia/wikipedia replaces euirim/goodwiki (script-based, broken)
+    ("wikimedia/wikipedia",           "20231101.en",   "train", "text", 4.0, "wikipedia"),
+    ("HuggingFaceTB/smollm-corpus",   "cosmopedia-v2", "train", "text", 2.0, "cosmopedia"),
+    # RedPajama-Data-1T is script-based and no longer loadable; weight redistributed below
+    ("HuggingFaceTB/smollm-corpus",   "fineweb-edu-dedup", "train", "text", 1.0, "fineweb_edu"),
 ]
 
 
 def stream_samples(hf_id, config, split, text_field, n, seed):
     """Stream n samples from a dataset without downloading the full thing."""
-    ds = load_dataset(hf_id, config, split=split, streaming=True, trust_remote_code=True)
+    ds = load_dataset(hf_id, config, split=split, streaming=True)
     ds = ds.shuffle(seed=seed, buffer_size=10_000)
     collected = []
     for row in ds:
