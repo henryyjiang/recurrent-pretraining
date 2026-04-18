@@ -83,6 +83,7 @@ from transformers import (
     get_cosine_schedule_with_warmup,
 )
 from recpre.raven_config_minimal import RavenConfig
+from recpre.raven_modeling_minimal import BottleneckProj
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +308,17 @@ def load_model(iter_injection="none", ccot_injection="none", train_loop=True):
         device_map=DEVICE,
         ignore_mismatched_sizes=True,
     )
+
+    # BottleneckProj weights are absent from the Huginn pretrained checkpoint
+    # (it only has iter_proj.weight / ccot_proj.weight for the full-rank case).
+    # With device_map loading, missing keys are materialised from meta tensors
+    # as uninitialised CUDA memory.  Bfloat16 garbage can overflow to Inf, and
+    # 0 * Inf = NaN, making the loss NaN from step 1.  Re-init explicitly here.
+    if ARGS.proj_bottleneck_dim > 0:
+        for m in model.modules():
+            if isinstance(m, BottleneckProj):
+                torch.nn.init.kaiming_uniform_(m.down.weight, a=5**0.5)
+                torch.nn.init.zeros_(m.up.weight)
 
     if ARGS.grad_checkpoint:
         model.gradient_checkpointing_enable()
