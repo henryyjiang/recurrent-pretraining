@@ -824,13 +824,16 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         if self.config.iter_injection == "add":
             # Residual add of projected previous-iteration output. Zero-init means
             # this is a strict no-op at the start of training.
-            x = x + self.transformer.iter_proj(x_prev)  # type: ignore
+            iter_mem = self.transformer.iter_proj(x_prev)  # type: ignore
+            iter_mem = torch.nn.functional.dropout(iter_mem, p=0.5, training=self.training)
+            x = x + iter_mem
 
         elif self.config.iter_injection == "prepend":
             # Prepend x_prev as S extra "thought tokens". KV caching unsupported.
             if past_key_values is not None:
                 raise ValueError("iter_injection='prepend' does not support KV caching.")
             x_mem = self.transformer.iter_proj(x_prev)  # type: ignore  [B, S, E]
+            x_mem = torch.nn.functional.dropout(x_mem, p=0.5, training=self.training)
             x = torch.cat([x_mem, x], dim=1)             # [B, 2*S, E]
             # Tile freqs_cis so x_current retains its original RoPE positions.
             freqs_cis = torch.cat([freqs_cis, freqs_cis], dim=1)

@@ -133,8 +133,13 @@ def parse_args():
                         "scripts/build_pretrain_sample_dataset.py).")
     p.add_argument("--pretrain_sample_path", default="data/pretrain_samples.jsonl",
                    help="Path to pretrain sample JSONL for --dataset pretrain_sample")
-    p.add_argument("--proj_bottleneck_dim", type=int, default=0,
+    p.add_argument("--proj_bottleneck_dim", type=int, default=64,
                    help="Bottleneck dim for iter_proj/ccot_proj (0 = full-rank 5280x5280)")
+    p.add_argument("--noise",      type=float, default=0.0,
+                   help="Gaussian noise magnitude injected at each recurrent step (test_time_noise scale)")
+    p.add_argument("--noise_type", type=str,   default="geom",
+                   choices=["fixed", "geom", "sqrt", "line", "chi"],
+                   help="Noise schedule for --noise")
     p.add_argument("--max_train_samples", type=int, default=None,
                    help="Cap total training examples (None = use full dataset). "
                         "For winogrande_hellaswag, split evenly between the two datasets.")
@@ -300,6 +305,8 @@ def load_model(iter_injection="none", ccot_injection="none", train_loop=True):
     cfg.iter_injection = iter_injection
     cfg.ccot_injection = ccot_injection
     cfg.proj_bottleneck_dim = ARGS.proj_bottleneck_dim
+    cfg.test_time_noise = ARGS.noise
+    cfg.test_time_noise_type = ARGS.noise_type
 
     model = AutoModelForCausalLM.from_pretrained(
         ARGS.model_name,
@@ -364,6 +371,8 @@ def load_checkpoint(name: str, iter_injection="none", ccot_injection="none"):
     cfg.iter_injection = iter_injection
     cfg.ccot_injection = ccot_injection
     cfg.proj_bottleneck_dim = ARGS.proj_bottleneck_dim
+    cfg.test_time_noise = ARGS.noise
+    cfg.test_time_noise_type = ARGS.noise_type
 
     model = AutoModelForCausalLM.from_pretrained(
         ARGS.model_name, config=cfg, torch_dtype=DTYPE,

@@ -9,43 +9,60 @@
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=hjiang378@gatech.edu
 
-# ── Create log dir if it doesn't exist ────────────────────────────────────
+# ── Usage ─────────────────────────────────────────────────────────────────────
+# Submit 4 variants (frozen/unfrozen × ccot_only/iter_only):
+#
+#   sbatch --export=EXPERIMENT=ccot_only,FROZEN=1 submit_ccot.slurm   # frozen ccot
+#   sbatch --export=EXPERIMENT=ccot_only,FROZEN=0 submit_ccot.slurm   # unfrozen ccot
+#   sbatch --export=EXPERIMENT=iter_only,FROZEN=1 submit_ccot.slurm   # frozen iter
+#   sbatch --export=EXPERIMENT=iter_only,FROZEN=0 submit_ccot.slurm   # unfrozen iter
+#
+# EXPERIMENT defaults to ccot_only, FROZEN defaults to 1 if not set.
+# ──────────────────────────────────────────────────────────────────────────────
+
+EXPERIMENT=${EXPERIMENT:-ccot_only}
+FROZEN=${FROZEN:-1}
+
 mkdir -p logs
 
-# ── Activate conda env ────────────────────────────────────────────────────
 source ~/.bashrc
 conda activate huginn
 
-# ── Point HuggingFace cache to scratch (avoids filling home quota) ────────
 export HF_HOME=$HOME/scratch/hf_cache
 export TRANSFORMERS_CACHE=$HF_HOME
 export HF_DATASETS_CACHE=$HF_HOME
 mkdir -p $HF_HOME
 
-# ── Move to repo root ─────────────────────────────────────────────────────
 cd $SLURM_SUBMIT_DIR
 
-# ── Run ──────────────────────────────────────────────────────────────────
 RUN_ID=$(date +%Y%m%d_%H%M%S)
+
+FROZEN_FLAG=""
+if [ "$FROZEN" = "1" ]; then
+    FROZEN_FLAG="--no_train_loop"
+fi
 
 PYTHON=$HOME/conda_envs/huginn/bin/python
 $PYTHON train_ccot.py \
-    --experiments ccot_only \
-    --output_dir  ./runs/ccot_${RUN_ID} \
-    --model_name  tomg-group-umd/huginn-0125 \
-    --hf_cache    $HOME/scratch/hf_cache \
-    --dataset     winogrande_hellaswag \
-    --max_train_samples 32000 \
-    --epochs      3 \
-    --lr          1e-4 \
-    --weight_decay 0.1 \
-    --batch_size  1 \
-    --grad_accum  32 \
-    --num_steps   32 \
-    --backprop_depth 4 \
+    --experiments        $EXPERIMENT \
+    --output_dir         ./runs/${EXPERIMENT}_frozen${FROZEN}_${RUN_ID} \
+    --model_name         tomg-group-umd/huginn-0125 \
+    --hf_cache           $HOME/scratch/hf_cache \
+    --dataset            pretrain_sample \
+    --max_train_samples  32000 \
+    --epochs             3 \
+    --lr                 1e-4 \
+    --weight_decay       0.1 \
+    --batch_size         1 \
+    --grad_accum         32 \
+    --num_steps          32 \
+    --backprop_depth     4 \
+    --proj_bottleneck_dim 64 \
+    --noise              0.15 \
+    --noise_type         geom \
     --grad_checkpoint \
-    --no_train_loop \
+    $FROZEN_FLAG \
     --skip_eval \
     --skip_qualitative
 
-echo "Job finished: $RUN_ID"
+echo "Job finished: ${EXPERIMENT} frozen=${FROZEN} run=${RUN_ID}"
