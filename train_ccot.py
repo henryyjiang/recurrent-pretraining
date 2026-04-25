@@ -87,6 +87,42 @@ from recpre.raven_modeling_minimal import BottleneckProj
 
 
 # ---------------------------------------------------------------------------
+# LoRA
+# ---------------------------------------------------------------------------
+class LoraLinear(torch.nn.Module):
+    """Wraps a frozen nn.Linear with a trainable low-rank delta: out = base(x) + scale * B(A(x))."""
+
+    def __init__(self, base: torch.nn.Linear, rank: int, alpha: float):
+        super().__init__()
+        in_f, out_f  = base.in_features, base.out_features
+        self.base    = base
+        self.lora_A  = torch.nn.Linear(in_f,  rank, bias=False)
+        self.lora_B  = torch.nn.Linear(rank, out_f, bias=False)
+        self.scaling = alpha / rank
+        torch.nn.init.kaiming_uniform_(self.lora_A.weight, a=5**0.5)
+        torch.nn.init.zeros_(self.lora_B.weight)
+        self.lora_A.to(dtype=base.weight.dtype)
+        self.lora_B.to(dtype=base.weight.dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.base(x) + self.scaling * self.lora_B(self.lora_A(x))
+
+
+def inject_lora(model, rank: int, alpha: float, target_attrs: list) -> int:
+    """Wrap matching Linear layers inside core_block with LoraLinear. Returns replaced count."""
+    replaced = 0
+    for mod_name, module in list(model.named_modules()):
+        if "core_block" not in mod_name:
+            continue
+        for attr in target_attrs:
+            child = getattr(module, attr, None)
+            if isinstance(child, torch.nn.Linear):
+                setattr(module, attr, LoraLinear(child, rank, alpha))
+                replaced += 1
+    return replaced
+
+
+# ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 def parse_args():
@@ -140,6 +176,15 @@ def parse_args():
     p.add_argument("--noise_type", type=str,   default="geom",
                    choices=["fixed", "geom", "sqrt", "line", "chi"],
                    help="Noise schedule for --noise")
+    p.add_argument("--lora_rank",    type=int,   default=0,
+                   help="LoRA rank for core_block adaptation (0 = disabled). "
+                        "Pairs with --no_train_loop: base weights stay frozen, "
+                        "only LoRA deltas (+ ccot/iter proj) are trained.")
+    p.add_argument("--lora_alpha",   type=float, default=None,
+                   help="LoRA scaling alpha (defaults to lora_rank, giving scale=1)")
+    p.add_argument("--lora_targets", type=str,   default="Wqkv,proj,fc",
+                   help="Comma-separated Linear attr names to wrap with LoRA inside core_block. "
+                        "'proj' matches both attn.proj and mlp.proj; 'Wqkv' is the QKV projection.")
     p.add_argument("--max_train_samples", type=int, default=None,
                    help="Cap total training examples (None = use full dataset). "
                         "For winogrande_hellaswag, split evenly between the two datasets.")
@@ -341,11 +386,21 @@ def load_model(iter_injection="none", ccot_injection="none", train_loop=True):
     for name, param in model.named_parameters():
         param.requires_grad = any(kw in name for kw in trainable_keywords)
 
+    if ARGS.lora_rank > 0:
+        lora_alpha = ARGS.lora_alpha or float(ARGS.lora_rank)
+        targets    = [t.strip() for t in ARGS.lora_targets.split(",")]
+        n_lora     = inject_lora(model, rank=ARGS.lora_rank, alpha=lora_alpha,
+                                 target_attrs=targets)
+        log(f"  LoRA injected: {n_lora} layers (rank={ARGS.lora_rank}, alpha={lora_alpha})")
+        for name, param in model.named_parameters():
+            if "lora_A" in name or "lora_B" in name:
+                param.requires_grad = True
+
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
     log(f"  Trainable: {n_train:,} / {n_total:,} params ({100*n_train/n_total:.2f}%)")
     log(f"  iter_injection={iter_injection!r}  ccot_injection={ccot_injection!r}  "
-        f"train_loop={train_loop}")
+        f"train_loop={train_loop}  lora_rank={ARGS.lora_rank}")
     return model
 
 
@@ -378,6 +433,11 @@ def load_checkpoint(name: str, iter_injection="none", ccot_injection="none"):
         ARGS.model_name, config=cfg, torch_dtype=DTYPE,
         device_map=DEVICE, ignore_mismatched_sizes=True,
     )
+
+    if ARGS.lora_rank > 0:
+        lora_alpha = ARGS.lora_alpha or float(ARGS.lora_rank)
+        targets    = [t.strip() for t in ARGS.lora_targets.split(",")]
+        inject_lora(model, rank=ARGS.lora_rank, alpha=lora_alpha, target_attrs=targets)
 
     weights_path = path / "trainable_weights.pt"
     if weights_path.exists():
