@@ -101,8 +101,8 @@ class LoraLinear(torch.nn.Module):
         self.scaling = alpha / rank
         torch.nn.init.kaiming_uniform_(self.lora_A.weight, a=5**0.5)
         torch.nn.init.zeros_(self.lora_B.weight)
-        self.lora_A.to(dtype=base.weight.dtype)
-        self.lora_B.to(dtype=base.weight.dtype)
+        self.lora_A.to(device=base.weight.device, dtype=base.weight.dtype)
+        self.lora_B.to(device=base.weight.device, dtype=base.weight.dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.base(x) + self.scaling * self.lora_B(self.lora_A(x))
